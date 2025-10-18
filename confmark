@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""
+Confmark: Bidirectional Confluence ↔ Markdown sync with Mermaid diagrams
+
+Usage:
+    confmark pull PAGE_ID FILE
+    confmark push PAGE_ID FILE
+
+Environment variables required:
+    CONFLUENCE_DOMAIN    Your Atlassian domain (e.g., "company.atlassian.net")
+    CONFLUENCE_EMAIL     Your Confluence email
+    CONFLUENCE_TOKEN     Your Confluence API token
+"""
+
+import argparse
+import base64
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+
+# ============================================================================
+# Global verbose flag
+# ============================================================================
+
+VERBOSE = False
+
+def log(msg: str) -> None:
+    """Print message only in verbose mode."""
+    if VERBOSE:
+        print(msg, file=sys.stderr)
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+
+def get_config() -> Tuple[str, str, str]:
+    """Load Confluence configuration from environment variables."""
+    required = {"CONFLUENCE_DOMAIN": os.getenv("CONFLUENCE_DOMAIN"),
+                "CONFLUENCE_EMAIL": os.getenv("CONFLUENCE_EMAIL"),
+                "CONFLUENCE_TOKEN": os.getenv("CONFLUENCE_TOKEN")}
+    
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        print(f"Missing environment variables: {', '.join(missing)}\n", file=sys.stderr)
+        print("Set them in your environment:", file=sys.stderr)
+        print('  export CONFLUENCE_DOMAIN="your-domain.atlassian.net"', file=sys.stderr)
+        print('  export CONFLUENCE_EMAIL="your.email@company.com"', file=sys.stderr)
+        print('  export CONFLUENCE_TOKEN="your_api_token"', file=sys.stderr)
+        print("\nGet API token at: https://id.atlassian.com/manage-profile/security/api-tokens", file=sys.stderr)
+        sys.exit(1)
+
+    return required["CONFLUENCE_DOMAIN"], required["CONFLUENCE_EMAIL"], required["CONFLUENCE_TOKEN"]
+
+
+# ============================================================================
+# Confluence API Client (using urllib)
+# ============================================================================
+
+
+def api_request(domain: str, email: str, token: str, path: str, 
+                method: str = "GET", data: Optional[Dict[str, Any]] = None,
+                params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Make HTTP request to Confluence API."""
+    url = f"https://{domain}/wiki{path}"
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    
+    # Build headers
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+    headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+    if data:
+        headers["Content-Type"] = "application/json"
+    
+    # Build request
+    request_data = json.dumps(data).encode("utf-8") if data else None
+    req = urllib.request.Request(url, data=request_data, headers=headers, method=method)
+    
+    # Execute request with error handling
+    try:
+        with urllib.request.urlopen(req) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8") if e.fp else ""
+        print(f"API request failed (HTTP {e.code}): {e.reason}", file=sys.stderr)
+        if error_body:
+            print(f"Response: {error_body[:4096]}", file=sys.stderr)
+        if e.code == 409:
+            print("Someone else edited the page. Pull latest first.", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Network error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ============================================================================
+# Pandoc Lua Filter (embedded)
+# ============================================================================
+
+PANDOC_LUA_FILTER = """-- Pandoc Lua filter for cleaning Confluence HTML export
+-- Strips spans/divs, converts links to text, images/SVG to figure placeholders
+
+figcount = 0
+
+function Span(el)
+    return el.content
+end
+
+function Div(el)
+    return el.content
+end
+
+function Link(el)
+    return el.content
+end
+
+local function figure_label(alt, title)
+    figcount = figcount + 1
+    local name = alt or title
+    if name and name ~= "" then
+        return pandoc.Str("(See Figure " .. figcount .. ": " .. name .. ")")
+    else
+        return pandoc.Str("(See Figure " .. figcount .. ")")
+    end
+end
+
+function Image(el)
+    local alt = ""
+    if el.caption ~= nil then
+        alt = pandoc.utils.stringify(el.caption)
+    elseif el.alt ~= nil then
+        alt = pandoc.utils.stringify(el.alt)
+    end
+    if alt == "" then
+        alt = nil
+    end
+    local title = el.title or ""
+    if title == "" then
+        title = nil
+    end
+    return {figure_label(alt, title)}
+end
+
+function RawBlock(el)
+    if el.format:match("html") then
+        local s = (el.text or ""):lower()
+        if s:find("<svg") or s:find("data:image") then
+            return {figure_label(nil, "Embedded graphic")}
+        end
+    end
+    return el
+end
+
+function RawInline(el)
+    if el.format:match("html") then
+        local s = (el.text or ""):lower()
+        if s:find("<svg") or s:find("data:image") then
+            return {figure_label(nil, "Embedded graphic")}
+        end
+    end
+    return el
+end
+
+-- Track if we've seen any H2 headings yet (to detect TOC position)
+seen_heading = false
+
+-- Handle Confluence Mermaid rendering errors
+-- Workaround: Confluence export_view sometimes fails to render Mermaid macros (404 errors)
+-- even though the macro exists in ADF/storage format. We extract diagrams from ADF directly,
+-- so we create ONE placeholder for the main error (to be replaced with actual Mermaid from ADF),
+-- but skip the additional error details/permission messages to prevent phantom placeholders.
+function Para(el)
+    local text = pandoc.utils.stringify(el)
+    
+    -- Main error heading → create placeholder (will be replaced with actual Mermaid from ADF)
+    if text:find("Getting Mermaid diagram failed") then
+        figcount = figcount + 1
+        return {pandoc.Para({pandoc.Str("(See Figure " .. figcount .. ")")})}
+    end
+    
+    -- Error details and permission messages → skip entirely (follow-up text, not diagrams)
+    if text:find("An error occurred while retrieving the Mermaid diagram") or
+       text:find("Please make sure the user") then
+        return {}
+    end
+    
+    return el
+end
+
+function Header(el)
+    if el.level == 2 then
+        seen_heading = true
+    end
+    return el
+end
+
+-- Filter out rendered TOC (bullet list before first H2, with section-like names)
+function BulletList(el)
+    -- Only check lists that appear before any H2 headings
+    if not seen_heading and #el.content > 3 then
+        -- Check if this looks like a TOC (multiple items with capitalized text)
+        local toc_like = true
+        local checked = 0
+        for _, item in ipairs(el.content) do
+            if checked < 5 then
+                local text = pandoc.utils.stringify(item)
+                -- TOC items are typically short and start with capital letter
+                if #text < 5 or not text:match("^[A-Z]") then
+                    toc_like = false
+                    break
+                end
+                checked = checked + 1
+            end
+        end
+        if toc_like then
+            -- This is likely a rendered TOC - add marker heading
+            return {pandoc.Header(2, {pandoc.Str("Table"), pandoc.Space(), pandoc.Str("of"), pandoc.Space(), pandoc.Str("Contents")})}
+        end
+    end
+    return el
+end
+"""
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+
+def run_pandoc(input_format: str, output_format: str, content: str, use_lua_filter: bool = False) -> str:
+    """Run pandoc to convert between formats."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=f".{input_format}", delete=False) as tmp_in:
+        tmp_in.write(content)
+        tmp_in_path = tmp_in.name
+
+    # Create temp Lua filter if needed
+    lua_filter_path = None
+    if use_lua_filter:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", delete=False) as tmp_lua:
+            tmp_lua.write(PANDOC_LUA_FILTER)
+            lua_filter_path = tmp_lua.name
+
+    try:
+        cmd = [
+            "pandoc",
+            "-f", input_format,
+            "-t", output_format,
+            "--wrap=none",
+        ]
+        
+        if lua_filter_path:
+            cmd.extend(["--lua-filter", lua_filter_path])
+        
+        if output_format == "gfm":
+            cmd.append("--reference-links")
+        
+        cmd.append(tmp_in_path)
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return result.stdout
+        
+    except FileNotFoundError:
+        print("Pandoc not found. Install it:", file=sys.stderr)
+        print("  macOS: brew install pandoc", file=sys.stderr)
+        print("  Ubuntu/Debian: apt-get install pandoc", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Pandoc conversion failed: {e}", file=sys.stderr)
+        print(f"Stderr: {e.stderr}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        Path(tmp_in_path).unlink()
+        if lua_filter_path:
+            Path(lua_filter_path).unlink()
+
+
+# ============================================================================
+# Pull Command: Confluence → Markdown
+# ============================================================================
+
+
+def extract_mermaid_from_adf(adf_data: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    """Recursively extract Mermaid diagrams from ADF nodes."""
+    mermaid_diagrams: Dict[str, Dict[str, str]] = {}
+
+    def extract_from_node(node: Any) -> None:
+        if isinstance(node, dict):
+            if (
+                node.get("type") == "extension"
+                and node.get("attrs", {}).get("extensionKey") == "confluence-mermaid-macro"
+            ):
+                local_id = node.get("attrs", {}).get("localId")
+                params = node.get("attrs", {}).get("parameters", {}).get("macroParams", {})
+                title = params.get("title", {}).get("value", "")
+                body_content = params.get("__bodyContent", {}).get("value")
+
+                if not local_id:
+                    macro_metadata = params.get("macroMetadata", {})
+                    local_id = macro_metadata.get("macroId", {}).get("value", f"macro_{len(mermaid_diagrams)}")
+
+                if local_id and body_content:
+                    try:
+                        # Parse the body_content JSON which may be HTML-escaped by Confluence
+                        mermaid_source = None
+                        
+                        if isinstance(body_content, str):
+                            # The body_content is already properly JSON-escaped in ADF
+                            # Just parse it directly - json.loads handles all the unescaping
+                            try:
+                                body_data = json.loads(body_content)
+                            except json.JSONDecodeError as e:
+                                # If direct parsing fails, try HTML unescape first
+                                # (in case Confluence HTML-escaped it)
+                                try:
+                                    body_data = json.loads(html.unescape(body_content))
+                                except json.JSONDecodeError:
+                                    # Last resort: treat as raw content
+                                    body_data = {"body": body_content}
+                        else:
+                            body_data = body_content
+
+                        # Extract the mermaid source from the parsed data
+                        # Note: json.loads() already unescaped \n, \", etc. during parsing
+                        if isinstance(body_data, list) and body_data:
+                            # Format: [{"body":"...","date":...}]
+                            mermaid_source = body_data[-1].get("body", "")
+                        elif isinstance(body_data, dict):
+                            # Format: {"body":"..."}
+                            mermaid_source = body_data.get("body", "")
+                        else:
+                            mermaid_source = str(body_data)
+
+                        if mermaid_source:
+                            mermaid_diagrams[local_id] = {
+                                "title": title,
+                                "source": mermaid_source.strip(),
+                            }
+                            log(f"Extracted Mermaid: localId={local_id}, title='{title}'")
+                        else:
+                            print(f"No Mermaid source found in {local_id}", file=sys.stderr)
+                    except (KeyError, TypeError, AttributeError) as e:
+                        print(f"Error parsing Mermaid {local_id}: {e}", file=sys.stderr)
+
+            for key, value in node.items():
+                if key in ["content", "attrs"]:
+                    extract_from_node(value)
+        elif isinstance(node, list):
+            for item in node:
+                extract_from_node(item)
+
+    try:
+        adf_content = json.loads(adf_data["body"]["atlas_doc_format"]["value"])
+        extract_from_node(adf_content)
+    except (KeyError, json.JSONDecodeError) as e:
+        print(f"Error processing ADF: {e}", file=sys.stderr)
+
+    return mermaid_diagrams
+
+
+def replace_figures_with_mermaid(markdown_content: str, mermaid_diagrams: Dict) -> str:
+    """Replace figure placeholders with actual Mermaid diagrams."""
+    # Convert dict to ordered list (maintains ADF extraction order)
+    diagrams_list = list(mermaid_diagrams.items())
+    diagram_index = 0
+    figure_counter = 0
+    output_lines = []
+
+    for line in markdown_content.split("\n"):
+        if re.search(r"\(See Figure \d+[^)]*\)", line):
+            if diagram_index < len(diagrams_list):
+                local_id, diagram = diagrams_list[diagram_index]
+                diagram_index += 1
+                figure_counter += 1
+
+                if diagram["title"]:
+                    output_lines.append(f"### Figure {figure_counter}: {diagram['title']}")
+                else:
+                    output_lines.append(f"### Figure {figure_counter}")
+
+                output_lines.append("")
+                output_lines.append("```mermaid")
+                output_lines.append(diagram["source"])
+                output_lines.append("```")
+                output_lines.append("")
+
+                log(f"Placed Figure {figure_counter} inline (localId: {local_id})")
+            else:
+                output_lines.append(line)
+        else:
+            output_lines.append(line)
+
+    return "\n".join(output_lines)
+
+
+def clean_markdown(markdown: str) -> str:
+    """Clean up markdown for better git readability."""
+    def is_list_item(text: str) -> bool:
+        """Check if line is a list item (bullet or numbered)."""
+        stripped = text.lstrip()
+        # Bullet lists
+        if stripped.startswith(("- ", "* ", "+ ")):
+            return True
+        # Numbered lists (any number of digits)
+        return bool(re.match(r'^\d+\.\s', stripped))
+    
+    lines = markdown.split("\n")
+    cleaned = []
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i]
+        
+        # Detect start of TOC section
+        if line.strip() == "## Table of Contents":
+            cleaned.append(line)
+            i += 1
+            # Skip the blank line after heading
+            if i < len(lines) and not lines[i].strip():
+                i += 1
+            # Skip all the rendered TOC list items until we hit the next section or blank line + non-list
+            while i < len(lines):
+                if lines[i].startswith("## "):
+                    # Next section - exit TOC and add blank line before next heading
+                    cleaned.append("")
+                    break
+                elif lines[i].strip() and not lines[i].lstrip().startswith(("- ", "\\- ")):
+                    # Non-list content - exit TOC
+                    break
+                i += 1
+            continue
+        
+        # Remove all blank lines after headings, but keep one if next line is also a heading
+        if line.startswith("#"):
+            cleaned.append(line)
+            i += 1
+            # Skip all blank lines after heading
+            blank_count = 0
+            while i < len(lines) and not lines[i].strip():
+                blank_count += 1
+                i += 1
+            # If next line is also a heading, keep one blank line
+            if i < len(lines) and lines[i].startswith("#"):
+                cleaned.append("")
+            continue
+        
+        # If current line is blank and previous line was a list item,
+        # check if next line is also a list item
+        if (not line.strip() and 
+            len(cleaned) > 0 and 
+            cleaned[-1].strip() and
+            is_list_item(cleaned[-1]) and
+            i + 1 < len(lines) and
+            is_list_item(lines[i + 1])):
+            # Skip this blank line (compact the list)
+            i += 1
+            continue
+        
+        cleaned.append(line)
+        i += 1
+    
+    return "\n".join(cleaned)
+
+
+def pull_command(page_id: str, output_file: Optional[str] = None) -> None:
+    """Pull a Confluence page and convert to Markdown."""
+    domain, email, token = get_config()
+
+    log(f"Fetching page {page_id}...")
+
+    # Get page with HTML content
+    page_data = api_request(domain, email, token, f"/rest/api/content/{page_id}",
+                           params={"expand": "body.export_view,body.view,title,version"})
+
+    title = page_data.get("title", page_id)
+    version = page_data.get("version", {}).get("number")
+    log(f"Title: {title}")
+    log(f"Version: {version}")
+
+    # Get HTML content
+    html_content = page_data.get("body", {}).get("export_view", {}).get("value")
+    if not html_content:
+        html_content = page_data.get("body", {}).get("view", {}).get("value")
+
+    if not html_content:
+        print("No HTML content found", file=sys.stderr)
+        sys.exit(1)
+
+    # Convert HTML to Markdown with Lua filter
+    log("Converting HTML -> Markdown...")
+    markdown_content = run_pandoc("html", "gfm", html_content, use_lua_filter=True)
+    
+    # Clean up markdown formatting (compact lists, etc.)
+    markdown_content = clean_markdown(markdown_content)
+
+    # Fetch ADF for Mermaid extraction
+    log("Fetching ADF for Mermaid extraction...")
+    try:
+        adf_data = api_request(domain, email, token, f"/api/v2/pages/{page_id}",
+                              params={"body-format": "atlas_doc_format"})
+    except Exception as e:
+        print(f"Failed to fetch ADF: {e}", file=sys.stderr)
+        adf_data = None
+
+    # Extract and insert Mermaid diagrams
+    if adf_data:
+        mermaid_diagrams = extract_mermaid_from_adf(adf_data)
+        log(f"Found {len(mermaid_diagrams)} Mermaid diagram(s)")
+
+        if mermaid_diagrams:
+            log("Inserting Mermaid diagrams...")
+            markdown_content = replace_figures_with_mermaid(markdown_content, mermaid_diagrams)
+
+    # Write output: file or stdout
+    if output_file:
+        Path(output_file).write_text(markdown_content, encoding="utf-8")
+        print(f"Wrote: {output_file}", file=sys.stderr)
+    else:
+        # No file specified - write to stdout
+        sys.stdout.write(markdown_content)
+
+
+# ============================================================================
+# Push Command: Markdown → Confluence
+# ============================================================================
+
+
+def convert_mermaid_blocks(text: str) -> str:
+    """Convert ```mermaid blocks to Confluence mermaid macros."""
+    pattern = r"### Figure (\d+)(?:: ([^\n]*))?\n\n```mermaid\n(.*?)\n```"
+
+    def replace_mermaid(match):
+        figure_num = match.group(1)
+        title = match.group(2) or ""
+        mermaid_code = match.group(3)
+
+        # Escape for JSON first: \, ", newlines
+        escaped_code = mermaid_code.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        # Format as Confluence expects (the date field appears to be optional based on testing)
+        body_content = f'[{{"body":"{escaped_code}"}}]'
+
+        # Use CDATA to avoid XML parsing issues with special characters
+        macro = f'''<ac:structured-macro ac:name="confluence-mermaid-macro" ac:schema-version="1">
+<ac:parameter ac:name="__bodyContent"><![CDATA[{body_content}]]></ac:parameter>'''
+
+        if title:
+            macro += f'\n<ac:parameter ac:name="title">{html.escape(title)}</ac:parameter>'
+
+        macro += """
+<ac:parameter ac:name="theme">default</ac:parameter>
+<ac:parameter ac:name="look">classic</ac:parameter>
+<ac:parameter ac:name="alignment">left</ac:parameter>
+</ac:structured-macro>"""
+
+        log(f"Converted Figure {figure_num} to Confluence macro")
+        return macro
+
+    return re.sub(pattern, replace_mermaid, text, flags=re.DOTALL)
+
+
+def convert_toc(text: str) -> str:
+    """Convert markdown TOC to Confluence TOC macro."""
+    def replace_toc(match):
+        log("Converting Table of Contents to Confluence macro")
+        return """<ac:structured-macro ac:name="toc" ac:schema-version="1">
+<ac:parameter ac:name="printable">true</ac:parameter>
+<ac:parameter ac:name="style">none</ac:parameter>
+<ac:parameter ac:name="maxLevel">6</ac:parameter>
+<ac:parameter ac:name="minLevel">1</ac:parameter>
+<ac:parameter ac:name="type">list</ac:parameter>
+<ac:parameter ac:name="outline">false</ac:parameter>
+<ac:parameter ac:name="include"></ac:parameter>
+<ac:parameter ac:name="exclude">Table of Contents</ac:parameter>
+</ac:structured-macro>"""
+
+    # Pattern 1: Just the heading (cleaned version from pull)
+    # Match if followed by: another heading, blank line + heading, or end of string
+    toc_pattern_heading_only = r"## Table of Contents\n(?=\n*##|\n*$)"
+    result = re.sub(toc_pattern_heading_only, replace_toc, text, flags=re.MULTILINE)
+    if result != text:
+        return result
+    
+    # Pattern 2: Markdown TOC with links
+    toc_pattern_links = r"## Table of Contents\n\n((?:- \[.*?\]\(#.*?\)\n)*)"
+    result = re.sub(toc_pattern_links, replace_toc, text, flags=re.MULTILINE)
+    if result != text:
+        return result
+    
+    # Pattern 3: Simple bullet list (pulled from Confluence before cleaning)
+    toc_pattern_simple = r"## Table of Contents\n\n((?:- [^\n]+\n)+)"
+    return re.sub(toc_pattern_simple, replace_toc, text, flags=re.MULTILINE)
+
+
+def markdown_to_confluence_storage(markdown_content: str) -> str:
+    """Convert markdown to Confluence storage format HTML."""
+    processed_content = convert_mermaid_blocks(markdown_content)
+    processed_content = convert_toc(processed_content)
+
+    html_content = run_pandoc("gfm", "html", processed_content)
+
+    # Clean up HTML for Confluence:
+    # Pandoc (with --wrap=none) doesn't wrap lines, so we just need to clean up block spacing.
+    
+    # These steps are opinionated, and they really only work for our specific workflow.
+    # It is irritating to have HTML tags in the markdown, so it removes them.
+    
+    # 1. Remove <p> tags but preserve paragraph breaks
+    html_content = re.sub(r"<p>", "", html_content)
+    html_content = re.sub(r"</p>", "\n\n", html_content)
+    
+    # 2. Remove newlines immediately after heading tags (prevents Confluence visual spacing)
+    html_content = re.sub(r'(</h[1-6]>)\s+', r'\1', html_content)
+    
+    # 3. Collapse multiple consecutive newlines
+    html_content = re.sub(r'\n{3,}', '\n\n', html_content)
+
+    # Unescape HTML entities for Confluence macros (do &amp; last to avoid double-unescaping)
+    for old, new in [("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&amp;", "&")]:
+        html_content = html_content.replace(old, new)
+
+    log("Converted markdown to HTML")
+    return html_content
+
+
+def push_command(page_id: str, markdown_file: Optional[str] = None) -> None:
+    """Push markdown content to a Confluence page."""
+    # Read from file or stdin
+    if markdown_file:
+        markdown_path = Path(markdown_file)
+        if not markdown_path.exists():
+            print(f"Error: Markdown file not found: {markdown_file}", file=sys.stderr)
+            sys.exit(1)
+        markdown_content = markdown_path.read_text(encoding="utf-8")
+    else:
+        # Read from stdin
+        if sys.stdin.isatty():
+            print("Error: No input file specified and stdin is empty", file=sys.stderr)
+            print("Usage: confmark push PAGE_ID [FILE] or pipe content via stdin", file=sys.stderr)
+            sys.exit(1)
+        markdown_content = sys.stdin.read()
+
+    domain, email, token = get_config()
+
+    log(f"Fetching current page {page_id}...")
+
+    # Get current page info
+    page_data = api_request(domain, email, token, f"/rest/api/content/{page_id}",
+                           params={"expand": "version,title"})
+
+    current_version = page_data["version"]["number"]
+    page_title = page_data["title"]
+    new_version = current_version + 1
+
+    log(f"Page: {page_title}")
+    log(f"Current version: {current_version} -> New version: {new_version}")
+
+    # Convert markdown to Confluence storage format
+    log("Converting markdown to Confluence storage format...")
+    storage_content = markdown_to_confluence_storage(markdown_content)
+
+    # Update the page
+    log(f"Updating Confluence page {page_id}...")
+    
+    payload = {
+        "version": {"number": new_version},
+        "title": page_title,
+        "type": "page",
+        "body": {
+            "storage": {
+                "value": storage_content,
+                "representation": "storage",
+            }
+        },
+    }
+
+    response = api_request(domain, email, token, f"/rest/api/content/{page_id}", 
+                          method="PUT", data=payload)
+    updated_version = response["version"]["number"]
+    
+    page_link = response.get('_links', {}).get('base', f"https://{domain}") + response.get('_links', {}).get('webui', f"/wiki/pages/{page_id}")
+    print(f"Updated to v{updated_version}: {page_link}", file=sys.stderr)
+
+
+# ============================================================================
+# Main CLI
+# ============================================================================
+
+
+def main():
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="Confmark: Sync Confluence ↔ Markdown with Mermaid diagrams",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s pull 123456789 document.md     # Pull to file
+  %(prog)s pull 123456789 > document.md   # Pull to stdout (redirect to file)
+  
+  %(prog)s push 123456789 document.md     # Push from file
+  cat document.md | %(prog)s push 123456789  # Push from stdin
+
+Environment variables required:
+  CONFLUENCE_DOMAIN    Your Atlassian domain (e.g., "company.atlassian.net")
+  CONFLUENCE_EMAIL     Your Confluence email
+  CONFLUENCE_TOKEN     Your Confluence API token
+
+Get API token at: https://id.atlassian.com/manage-profile/security/api-tokens
+        """,
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show detailed progress messages")
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # Pull subcommand
+    pull_parser = subparsers.add_parser("pull", help="Pull Confluence page to Markdown")
+    pull_parser.add_argument("page_id", help="Confluence page ID")
+    pull_parser.add_argument("file", nargs="?", help="Output markdown file (optional, defaults to stdout or auto-generated)")
+
+    # Push subcommand
+    push_parser = subparsers.add_parser("push", help="Push Markdown to Confluence page")
+    push_parser.add_argument("page_id", help="Confluence page ID")
+    push_parser.add_argument("file", nargs="?", help="Input markdown file (optional, defaults to stdin)")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # Set global verbose flag
+    global VERBOSE
+    VERBOSE = args.verbose
+
+    try:
+        if args.command == "pull":
+            pull_command(args.page_id, args.file)
+        elif args.command == "push":
+            push_command(args.page_id, args.file)
+    except KeyboardInterrupt:
+        print("\nCancelled", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        if VERBOSE:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
