@@ -4,7 +4,7 @@ Sync Confluence ↔ Markdown. Edit, use git, push back to Confluence.
 
 This does not support all Confluence features, but it does support Mermaid diagrams and a table of contents.
 
-This was built for a specific workflow: I need all technical docs to be in git and in a format that is equally meaningful to human and AI readers. I use Mermaid diagrams, since they render fine in Confluence and VSCode, and AI has no trouble understanding the meaning. They say "a picture is worth a thousand words", but for tech docs, I have found a picture is generally worth a few dozens words, and Mermaid is a fine way to express it. I want tech docs to be available as prompts for downstream work like detailed design and coding and the constraints of this project work well for that. 
+This was built for a specific workflow: I need all technical docs to be in git and in a format that is equally meaningful to human and AI readers. I use Mermaid diagrams, since they render fine in Confluence and VSCode, and AI has no trouble understanding the meaning. They say "a picture is worth a thousand words", but for tech docs, I have found a picture is generally worth a few dozen words, and Mermaid is a fine way to express it. I want tech docs to be available as prompts for downstream work like detailed design and coding and the constraints of this project work well for that. 
 
 `test-doc.md` in this repo shows how Mermaid and ToC are converted into markdown. Mermaid is not free in Confluence, but in VSCode, bierner.markdown-mermaid will render it in markdown preview.
 
