@@ -373,7 +373,6 @@ def replace_figures_with_mermaid(markdown_content: str, mermaid_diagrams: Dict) 
     # Convert dict to ordered list (maintains ADF extraction order)
     diagrams_list = list(mermaid_diagrams.items())
     diagram_index = 0
-    figure_counter = 0
     output_lines = []
 
     for line in markdown_content.split("\n"):
@@ -381,20 +380,13 @@ def replace_figures_with_mermaid(markdown_content: str, mermaid_diagrams: Dict) 
             if diagram_index < len(diagrams_list):
                 local_id, diagram = diagrams_list[diagram_index]
                 diagram_index += 1
-                figure_counter += 1
 
-                if diagram["title"]:
-                    output_lines.append(f"### Figure {figure_counter}: {diagram['title']}")
-                else:
-                    output_lines.append(f"### Figure {figure_counter}")
-
-                output_lines.append("")
                 output_lines.append("```mermaid")
                 output_lines.append(diagram["source"])
                 output_lines.append("```")
                 output_lines.append("")
 
-                log(f"Placed Figure {figure_counter} inline (localId: {local_id})")
+                log(f"Replaced figure placeholder with mermaid block (localId: {local_id})")
             else:
                 output_lines.append(line)
         else:
@@ -537,12 +529,10 @@ def pull_command(page_id: str, output_file: Optional[str] = None) -> None:
 
 def convert_mermaid_blocks(text: str) -> str:
     """Convert ```mermaid blocks to Confluence mermaid macros."""
-    pattern = r"### Figure (\d+)(?:: ([^\n]*))?\n\n```mermaid\n(.*?)\n```"
+    pattern = r"```mermaid\n(.*?)\n```"
 
     def replace_mermaid(match):
-        figure_num = match.group(1)
-        title = match.group(2) or ""
-        mermaid_code = match.group(3)
+        mermaid_code = match.group(1)
 
         # Escape for JSON first: \, ", newlines
         escaped_code = mermaid_code.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
@@ -551,18 +541,13 @@ def convert_mermaid_blocks(text: str) -> str:
 
         # Use CDATA to avoid XML parsing issues with special characters
         macro = f'''<ac:structured-macro ac:name="confluence-mermaid-macro" ac:schema-version="1">
-<ac:parameter ac:name="__bodyContent"><![CDATA[{body_content}]]></ac:parameter>'''
-
-        if title:
-            macro += f'\n<ac:parameter ac:name="title">{html.escape(title)}</ac:parameter>'
-
-        macro += """
+<ac:parameter ac:name="__bodyContent"><![CDATA[{body_content}]]></ac:parameter>
 <ac:parameter ac:name="theme">default</ac:parameter>
 <ac:parameter ac:name="look">classic</ac:parameter>
 <ac:parameter ac:name="alignment">left</ac:parameter>
-</ac:structured-macro>"""
+</ac:structured-macro>'''
 
-        log(f"Converted Figure {figure_num} to Confluence macro")
+        log(f"Converted mermaid block to Confluence macro")
         return macro
 
     return re.sub(pattern, replace_mermaid, text, flags=re.DOTALL)
