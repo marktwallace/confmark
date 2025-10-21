@@ -460,6 +460,29 @@ def clean_markdown(markdown: str) -> str:
     return "\n".join(cleaned)
 
 
+def fix_confluence_paragraph_structure(html: str) -> str:
+    """Fix Confluence's copy-paste bug that merges paragraphs into single <p> tags.
+    
+    When users copy-paste from text editors, Confluence sometimes creates malformed HTML:
+      <p>Paragraph 1\n\nParagraph 2\n\nParagraph 3</p>
+    
+    This should be:
+      <p>Paragraph 1</p><p>Paragraph 2</p><p>Paragraph 3</p>
+    
+    We fix this by splitting <p> tags that contain double newlines.
+    """
+    def split_paragraph(match):
+        p_content = match.group(1)
+        # Split on double newlines (blank lines)
+        paragraphs = re.split(r'\n\n+', p_content)
+        # Wrap each paragraph in <p> tags
+        return ''.join(f'<p>{p.strip()}</p>' for p in paragraphs if p.strip())
+    
+    # Match <p>...</p> tags and split any that contain double newlines
+    fixed_html = re.sub(r'<p>(.*?)</p>', split_paragraph, html, flags=re.DOTALL)
+    return fixed_html
+
+
 def pull_command(page_id: str, output_file: Optional[str] = None) -> None:
     """Pull a Confluence page and convert to Markdown."""
     domain, email, token = get_config()
@@ -483,6 +506,10 @@ def pull_command(page_id: str, output_file: Optional[str] = None) -> None:
     if not html_content:
         print("No HTML content found", file=sys.stderr)
         sys.exit(1)
+
+    # Fix Confluence's malformed paragraph structure (from copy-paste)
+    log("Fixing paragraph structure...")
+    html_content = fix_confluence_paragraph_structure(html_content)
 
     # Convert HTML to Markdown with Lua filter
     log("Converting HTML -> Markdown...")
@@ -590,20 +617,13 @@ def markdown_to_confluence_storage(markdown_content: str) -> str:
     html_content = run_pandoc("gfm", "html", processed_content)
 
     # Clean up HTML for Confluence:
-    # Pandoc (with --wrap=none) doesn't wrap lines, so we just need to clean up block spacing.
+    # Keep <p> tags - Confluence needs them for proper paragraph separation
+    # Pandoc generates clean, semantic HTML that we should preserve
     
-    # These steps are opinionated, and they really only work for our specific workflow.
-    # It is irritating to have HTML tags in the markdown, so it removes them.
-    
-    # 1. Remove <p> tags but preserve paragraph breaks
-    html_content = re.sub(r"<p>", "", html_content)
-    html_content = re.sub(r"</p>", "\n\n", html_content)
-    
-    # 2. Remove newlines immediately after heading tags (prevents Confluence visual spacing)
-    html_content = re.sub(r'(</h[1-6]>)\s+', r'\1', html_content)
-    
-    # 3. Collapse multiple consecutive newlines
-    html_content = re.sub(r'\n{3,}', '\n\n', html_content)
+    # Remove excessive whitespace after block elements
+    html_content = re.sub(r'(</h[1-6]>)\s+', r'\1\n', html_content)
+    html_content = re.sub(r'(</p>)\s+', r'\1\n', html_content)
+    html_content = re.sub(r'(</[ou]l>)\s+', r'\1\n', html_content)
 
     # Unescape HTML entities for Confluence macros (do &amp; last to avoid double-unescaping)
     for old, new in [("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&amp;", "&")]:
