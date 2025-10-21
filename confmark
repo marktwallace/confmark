@@ -109,7 +109,7 @@ def api_request(domain: str, email: str, token: str, path: str,
 # ============================================================================
 
 PANDOC_LUA_FILTER = """-- Pandoc Lua filter for cleaning Confluence HTML export
--- Strips spans/divs, converts links to text, images/SVG to figure placeholders
+-- Strips spans/divs, converts images/SVG to figure placeholders
 
 figcount = 0
 
@@ -118,10 +118,6 @@ function Span(el)
 end
 
 function Div(el)
-    return el.content
-end
-
-function Link(el)
     return el.content
 end
 
