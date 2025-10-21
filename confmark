@@ -168,9 +168,6 @@ function RawInline(el)
     return el
 end
 
--- Track if we've seen any H2 headings yet (to detect TOC position)
-seen_heading = false
-
 -- Handle Confluence Mermaid rendering errors
 -- Workaround: Confluence export_view sometimes fails to render Mermaid macros (404 errors)
 -- even though the macro exists in ADF/storage format. We extract diagrams from ADF directly,
@@ -191,39 +188,11 @@ function Para(el)
         return {}
     end
     
-    return el
-end
-
-function Header(el)
-    if el.level == 2 then
-        seen_heading = true
+    -- Check for TOC marker comment inserted by pre-processing
+    if text == "CONFLUENCE_TOC_MARKER" then
+        return {pandoc.Header(2, {pandoc.Str("Table"), pandoc.Space(), pandoc.Str("of"), pandoc.Space(), pandoc.Str("Contents")})}
     end
-    return el
-end
-
--- Filter out rendered TOC (bullet list before first H2, with section-like names)
-function BulletList(el)
-    -- Only check lists that appear before any H2 headings
-    if not seen_heading and #el.content > 3 then
-        -- Check if this looks like a TOC (multiple items with capitalized text)
-        local toc_like = true
-        local checked = 0
-        for _, item in ipairs(el.content) do
-            if checked < 5 then
-                local text = pandoc.utils.stringify(item)
-                -- TOC items are typically short and start with capital letter
-                if #text < 5 or not text:match("^[A-Z]") then
-                    toc_like = false
-                    break
-                end
-                checked = checked + 1
-            end
-        end
-        if toc_like then
-            -- This is likely a rendered TOC - add marker heading
-            return {pandoc.Header(2, {pandoc.Str("Table"), pandoc.Space(), pandoc.Str("of"), pandoc.Space(), pandoc.Str("Contents")})}
-        end
-    end
+    
     return el
 end
 """
@@ -460,6 +429,60 @@ def clean_markdown(markdown: str) -> str:
     return "\n".join(cleaned)
 
 
+def mark_confluence_toc(html: str) -> str:
+    """Mark Confluence TOC macros for conversion to markdown TOC heading.
+    
+    Confluence TOC macros render as bullet/ordered lists with anchor links to sections.
+    We identify them by:
+    1. Appearing early in the document (before main content)
+    2. Containing primarily anchor links (href="#...")
+    3. Not being inside tables
+    
+    Real TOCs are replaced with a marker paragraph that the Lua filter will convert.
+    """
+    # Look for lists that appear before the first heading and contain mostly anchor links
+    # Pattern: <ul> or <ol> with <li> items containing <a href="#...">
+    def is_toc_list(list_html: str) -> bool:
+        """Check if a list looks like a Confluence TOC."""
+        # Count items and anchor links
+        item_count = len(re.findall(r'<li', list_html))
+        anchor_count = len(re.findall(r'<a\s+[^>]*href=["\']#[^"\']+["\']', list_html))
+        
+        # TOC if: has items, and most items (>75%) are anchor links
+        return item_count >= 2 and anchor_count >= (item_count * 0.75)
+    
+    # Find lists that appear before the first heading and are not in tables
+    # Split by headings to identify the pre-heading section
+    heading_match = re.search(r'<h[1-6]', html)
+    if not heading_match:
+        return html  # No headings, no TOC to detect
+    
+    pre_heading = html[:heading_match.start()]
+    post_heading = html[heading_match.start():]
+    
+    # Check if we're inside a table by counting table tags
+    def replace_toc(match):
+        list_html = match.group(0)
+        # Make sure we're not inside a table
+        preceding_text = pre_heading[:match.start()]
+        table_open = preceding_text.count('<table')
+        table_close = preceding_text.count('</table>')
+        
+        if table_open > table_close:
+            # Inside a table, don't replace
+            return list_html
+        
+        if is_toc_list(list_html):
+            # Replace with marker
+            return '<p>CONFLUENCE_TOC_MARKER</p>'
+        return list_html
+    
+    # Look for <ul> or <ol> lists in the pre-heading section
+    pre_heading = re.sub(r'<[ou]l[^>]*>.*?</[ou]l>', replace_toc, pre_heading, flags=re.DOTALL)
+    
+    return pre_heading + post_heading
+
+
 def fix_confluence_paragraph_structure(html: str) -> str:
     """Fix Confluence's copy-paste bug that merges paragraphs into single <p> tags.
     
@@ -506,6 +529,10 @@ def pull_command(page_id: str, output_file: Optional[str] = None) -> None:
     if not html_content:
         print("No HTML content found", file=sys.stderr)
         sys.exit(1)
+
+    # Mark Confluence TOC macros (before Pandoc processing)
+    log("Detecting TOC macros...")
+    html_content = mark_confluence_toc(html_content)
 
     # Fix Confluence's malformed paragraph structure (from copy-paste)
     log("Fixing paragraph structure...")
