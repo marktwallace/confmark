@@ -109,9 +109,7 @@ def api_request(domain: str, email: str, token: str, path: str,
 # ============================================================================
 
 PANDOC_LUA_FILTER = """-- Pandoc Lua filter for cleaning Confluence HTML export
--- Strips spans/divs, converts images/SVG to figure placeholders
-
-figcount = 0
+-- Strips spans/divs for cleaner markdown output
 
 function Span(el)
     return el.content
@@ -121,72 +119,8 @@ function Div(el)
     return el.content
 end
 
-local function figure_label(alt, title)
-    figcount = figcount + 1
-    local name = alt or title
-    if name and name ~= "" then
-        return pandoc.Str("(See Figure " .. figcount .. ": " .. name .. ")")
-    else
-        return pandoc.Str("(See Figure " .. figcount .. ")")
-    end
-end
-
-function Image(el)
-    local alt = ""
-    if el.caption ~= nil then
-        alt = pandoc.utils.stringify(el.caption)
-    elseif el.alt ~= nil then
-        alt = pandoc.utils.stringify(el.alt)
-    end
-    if alt == "" then
-        alt = nil
-    end
-    local title = el.title or ""
-    if title == "" then
-        title = nil
-    end
-    return {figure_label(alt, title)}
-end
-
-function RawBlock(el)
-    if el.format:match("html") then
-        local s = (el.text or ""):lower()
-        if s:find("<svg") or s:find("data:image") then
-            return {figure_label(nil, "Embedded graphic")}
-        end
-    end
-    return el
-end
-
-function RawInline(el)
-    if el.format:match("html") then
-        local s = (el.text or ""):lower()
-        if s:find("<svg") or s:find("data:image") then
-            return {figure_label(nil, "Embedded graphic")}
-        end
-    end
-    return el
-end
-
--- Handle Confluence Mermaid rendering errors
--- Workaround: Confluence export_view sometimes fails to render Mermaid macros (404 errors)
--- even though the macro exists in ADF/storage format. We extract diagrams from ADF directly,
--- so we create ONE placeholder for the main error (to be replaced with actual Mermaid from ADF),
--- but skip the additional error details/permission messages to prevent phantom placeholders.
 function Para(el)
     local text = pandoc.utils.stringify(el)
-    
-    -- Main error heading → create placeholder (will be replaced with actual Mermaid from ADF)
-    if text:find("Getting Mermaid diagram failed") then
-        figcount = figcount + 1
-        return {pandoc.Para({pandoc.Str("(See Figure " .. figcount .. ")")})}
-    end
-    
-    -- Error details and permission messages → skip entirely (follow-up text, not diagrams)
-    if text:find("An error occurred while retrieving the Mermaid diagram") or
-       text:find("Please make sure the user") then
-        return {}
-    end
     
     -- Check for TOC marker comment inserted by pre-processing
     if text == "CONFLUENCE_TOC_MARKER" then
@@ -333,31 +267,56 @@ def extract_mermaid_from_adf(adf_data: Dict[str, Any]) -> Dict[str, Dict[str, st
     return mermaid_diagrams
 
 
-def replace_figures_with_mermaid(markdown_content: str, mermaid_diagrams: Dict) -> str:
-    """Replace figure placeholders with actual Mermaid diagrams."""
+def mark_mermaid_positions(html: str) -> str:
+    """Mark positions where Mermaid diagrams appear in HTML.
+    
+    Confluence renders Mermaid macros as <img> tags with base64 SVG data.
+    We replace these with text markers so Pandoc preserves their positions.
+    Later we'll inject actual Mermaid source from ADF at these positions.
+    """
+    mermaid_count = 0
+    
+    def replace_img(match):
+        nonlocal mermaid_count
+        img_tag = match.group(0)
+        # Check if this looks like a Mermaid diagram (large base64 SVG)
+        if 'data:image/svg+xml' in img_tag and len(img_tag) > 200:
+            mermaid_count += 1
+            return f'<p>MERMAID_DIAGRAM_MARKER_{mermaid_count}</p>'
+        return img_tag
+    
+    # Replace img tags with markers
+    html = re.sub(r'<img[^>]*>', replace_img, html)
+    return html
+
+
+def inject_mermaid_from_adf(markdown_content: str, mermaid_diagrams: Dict) -> str:
+    """Inject Mermaid diagrams from ADF into markdown at marked positions.
+    
+    Mermaid macros appear in document order in both HTML and ADF.
+    We replace position markers with actual source code from ADF.
+    """
+    if not mermaid_diagrams:
+        return markdown_content
+    
     # Convert dict to ordered list (maintains ADF extraction order)
-    diagrams_list = list(mermaid_diagrams.items())
-    diagram_index = 0
-    output_lines = []
-
-    for line in markdown_content.split("\n"):
-        if re.search(r"\(See Figure \d+[^)]*\)", line):
-            if diagram_index < len(diagrams_list):
-                local_id, diagram = diagrams_list[diagram_index]
-                diagram_index += 1
-
-                output_lines.append("```mermaid")
-                output_lines.append(diagram["source"])
-                output_lines.append("```")
-                output_lines.append("")
-
-                log(f"Replaced figure placeholder with mermaid block (localId: {local_id})")
-            else:
-                output_lines.append(line)
+    diagrams_list = list(mermaid_diagrams.values())
+    
+    # Replace markers with actual Mermaid blocks
+    def replace_marker(match):
+        marker_num = int(match.group(1))
+        idx = marker_num - 1  # Markers are 1-indexed
+        
+        if idx < len(diagrams_list):
+            diagram = diagrams_list[idx]
+            log(f"Injecting Mermaid diagram {marker_num}")
+            return f"\n```mermaid\n{diagram['source']}\n```\n"
         else:
-            output_lines.append(line)
-
-    return "\n".join(output_lines)
+            log(f"Warning: Marker {marker_num} but only {len(diagrams_list)} diagrams in ADF")
+            return ""
+    
+    markdown_content = re.sub(r'MERMAID_DIAGRAM_MARKER_(\d+)', replace_marker, markdown_content)
+    return markdown_content
 
 
 def clean_markdown(markdown: str) -> str:
@@ -374,9 +333,23 @@ def clean_markdown(markdown: str) -> str:
     lines = markdown.split("\n")
     cleaned = []
     i = 0
+    in_code_fence = False
     
     while i < len(lines):
         line = lines[i]
+        
+        # Track code fences (``` or ~~~)
+        if line.strip().startswith("```") or line.strip().startswith("~~~"):
+            in_code_fence = not in_code_fence
+            cleaned.append(line)
+            i += 1
+            continue
+        
+        # Skip all formatting logic if inside code fence
+        if in_code_fence:
+            cleaned.append(line)
+            i += 1
+            continue
         
         # Detect start of TOC section
         if line.strip() == "## Table of Contents":
@@ -534,6 +507,10 @@ def pull_command(page_id: str, output_file: Optional[str] = None) -> None:
     log("Detecting TOC macros...")
     html_content = mark_confluence_toc(html_content)
 
+    # Mark positions where Mermaid diagrams appear
+    log("Marking Mermaid positions...")
+    html_content = mark_mermaid_positions(html_content)
+
     # Fix Confluence's malformed paragraph structure (from copy-paste)
     log("Fixing paragraph structure...")
     html_content = fix_confluence_paragraph_structure(html_content)
@@ -554,14 +531,14 @@ def pull_command(page_id: str, output_file: Optional[str] = None) -> None:
         print(f"Failed to fetch ADF: {e}", file=sys.stderr)
         adf_data = None
 
-    # Extract and insert Mermaid diagrams
+    # Extract and insert Mermaid diagrams from ADF
     if adf_data:
         mermaid_diagrams = extract_mermaid_from_adf(adf_data)
         log(f"Found {len(mermaid_diagrams)} Mermaid diagram(s)")
 
         if mermaid_diagrams:
-            log("Inserting Mermaid diagrams...")
-            markdown_content = replace_figures_with_mermaid(markdown_content, mermaid_diagrams)
+            log("Injecting Mermaid diagrams from ADF...")
+            markdown_content = inject_mermaid_from_adf(markdown_content, mermaid_diagrams)
 
     # Write output: file or stdout
     if output_file:
