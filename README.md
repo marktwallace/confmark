@@ -4,6 +4,8 @@ Sync Confluence ↔ Markdown. Edit, use git, push back to Confluence.
 
 This does not support all Confluence features, but it does support Mermaid diagrams and a table of contents.
 
+**confcomments** is a companion tool that exports page comments to readable markdown (see below).
+
 This was built for a specific workflow: I need all technical docs to be in git and in a format that is equally meaningful to human and AI readers. I use Mermaid diagrams, since they render fine in Confluence and VSCode, and AI has no trouble understanding the meaning. They say "a picture is worth a thousand words", but for tech docs, I have found a picture is generally worth a few dozen words, and Mermaid is a fine way to express it. I want tech docs to be available as prompts for downstream work like detailed design and coding and the constraints of this project work well for that. 
 
 `test-doc.md` in this repo shows how Mermaid and ToC are converted into markdown. Mermaid is not free in Confluence, but in VSCode, bierner.markdown-mermaid will render it in markdown preview.
@@ -91,4 +93,42 @@ I made it one file so there is no install, sacrificing some readablity for conve
 **Version conflict (409)**: Someone edited the page, pull first
 
 **Pandoc not found**: Install with brew/apt (see Install section)
+
+---
+
+# confcomments
+
+Export Confluence page comments to readable markdown. Perfect for AI analysis or archival.
+
+## Features
+
+- Exports all comments (page-level and inline) in readable markdown format
+- Shows highlighted text context for inline comments
+
+## Install
+
+```bash
+# Download confcomments (one file)
+curl -O https://raw.githubusercontent.com/marktwallace/confmark/main/confcomments
+chmod +x confcomments
+```
+
+Uses the same environment variables as confmark (see Configure section above).
+
+## Use
+
+```bash
+# Export comments to file
+./confcomments 123456789 comments.md
+
+# Export to stdout
+./confcomments 123456789 > comments.md
+
+# Hide resolved comments
+./confcomments 123456789 --hide-resolved comments.md
+
+# Verbose mode
+./confcomments -v 123456789 comments.md
+```
+
 
