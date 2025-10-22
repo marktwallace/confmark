@@ -112,6 +112,7 @@ PANDOC_LUA_FILTER = """-- Pandoc Lua filter for cleaning Confluence HTML export
 -- Strips spans/divs for cleaner markdown output
 
 function Span(el)
+    -- Strip all spans (including any leftover comment markers)
     return el.content
 end
 
@@ -265,6 +266,130 @@ def extract_mermaid_from_adf(adf_data: Dict[str, Any]) -> Dict[str, Dict[str, st
         print(f"Error processing ADF: {e}", file=sys.stderr)
 
     return mermaid_diagrams
+
+
+def fetch_inline_comments(domain: str, email: str, token: str, page_id: str) -> Dict[str, Dict[str, str]]:
+    """Fetch inline comments for a page and return mapping of markerRef → comment data.
+    
+    Returns dict: {markerRef: {author: "Full Name", body: "comment text"}}
+    """
+    try:
+        comments_data = api_request(domain, email, token, 
+                                    f"/rest/api/content/{page_id}/child/comment",
+                                    params={"expand": "body.storage,version,extensions.inlineProperties,history.createdBy"})
+        
+        comments_map = {}
+        for comment in comments_data.get("results", []):
+            # Check if this is an inline comment (has markerRef)
+            inline_props = comment.get("extensions", {}).get("inlineProperties", {})
+            marker_ref = inline_props.get("markerRef")
+            
+            if marker_ref:
+                # Extract author name
+                created_by = comment.get("history", {}).get("createdBy", {})
+                author = created_by.get("displayName", "Unknown Author")
+                
+                # Extract comment body (strip HTML tags for readability)
+                body_html = comment.get("body", {}).get("storage", {}).get("value", "")
+                # Simple HTML tag removal (good enough for comments)
+                body_text = re.sub(r'<[^>]+>', '', body_html)
+                body_text = html.unescape(body_text).strip()
+                
+                comments_map[marker_ref] = {
+                    "author": author,
+                    "body": body_text
+                }
+                log(f"Found inline comment by {author}: {body_text[:50]}...")
+        
+        return comments_map
+    except Exception as e:
+        log(f"Failed to fetch comments: {e}")
+        return {}
+
+
+def extract_inline_comments_with_context(html_content: str, comments_map: Dict[str, Dict[str, str]]) -> list:
+    """Extract inline comments with their highlighted text context.
+    
+    Returns list of {text, author, body} dicts in document order.
+    """
+    comments_list = []
+    
+    # Find all inline comment markers in order
+    pattern = r'<span[^>]*class="inline-comment-marker"[^>]*data-ref="([^"]+)"[^>]*>(.*?)</span>'
+    
+    for match in re.finditer(pattern, html_content, flags=re.DOTALL):
+        data_ref = match.group(1)
+        highlighted_text = match.group(2)
+        # Strip HTML tags from highlighted text
+        highlighted_text = re.sub(r'<[^>]+>', '', highlighted_text).strip()
+        
+        if data_ref in comments_map:
+            comment = comments_map[data_ref]
+            comments_list.append({
+                "text": highlighted_text,
+                "author": comment["author"],
+                "body": comment["body"]
+            })
+    
+    return comments_list
+
+
+def format_comments_as_markdown(page_title: str, comments_list: list) -> str:
+    """Format inline comments as a separate markdown document.
+    
+    Uses blockquote format for readability by both humans and AI.
+    """
+    if not comments_list:
+        return ""
+    
+    lines = [
+        f"# Inline Comments on: {page_title}",
+        "",
+        f"*This file contains {len(comments_list)} inline comment(s) from Confluence.*",
+        f"*Comments are shown in document order with the highlighted text for context.*",
+        ""
+    ]
+    
+    for i, comment in enumerate(comments_list, 1):
+        lines.append(f"## Comment {i}")
+        lines.append("")
+        lines.append(f"> **On text:** \"{comment['text']}\"  ")
+        lines.append(f"> **{comment['author']}:**  ")
+        lines.append(f"> {comment['body']}")
+        lines.append("")
+    
+    return "\n".join(lines)
+
+
+def remove_inline_comment_markers(html_content: str) -> str:
+    """Remove inline comment marker spans from HTML (keep just the text).
+    
+    Removes: <span class="inline-comment-marker" data-ref="...">text</span>
+    Keeps: text
+    """
+    pattern = r'<span[^>]*class="inline-comment-marker"[^>]*data-ref="[^"]+"[^>]*>(.*?)</span>'
+    html_content = re.sub(pattern, r'\1', html_content, flags=re.DOTALL)
+    return html_content
+
+
+def restore_inline_comment_markers(html: str) -> str:
+    """Restore Confluence inline comment marker attribute names.
+    
+    Pandoc preserves inline-comment-marker spans but changes data-ref to ref.
+    Confluence needs the exact attribute name data-ref to attach comments.
+    
+    Converts:
+      <span class="inline-comment-marker" ref="UUID">text</span>
+    to:
+      <span class="inline-comment-marker" data-ref="UUID">text</span>
+    """
+    # Fix attribute name: ref → data-ref
+    html = re.sub(
+        r'(<span[^>]*class="inline-comment-marker"[^>]*)\sref="([^"]+)"',
+        r'\1 data-ref="\2"',
+        html
+    )
+    return html
 
 
 def mark_mermaid_positions(html: str) -> str:
@@ -503,6 +628,22 @@ def pull_command(page_id: str, output_file: Optional[str] = None) -> None:
         print("No HTML content found", file=sys.stderr)
         sys.exit(1)
 
+    # Fetch inline comments for AI visibility
+    log("Fetching inline comments...")
+    comments_map = fetch_inline_comments(domain, email, token, page_id)
+    comments_list = []
+    comments_file = None
+    
+    if comments_map:
+        log(f"Found {len(comments_map)} inline comment(s)")
+        # Extract comments with context before removing markers
+        comments_list = extract_inline_comments_with_context(html_content, comments_map)
+        # Remove markers from main document
+        html_content = remove_inline_comment_markers(html_content)
+        # Prepare comments file path
+        base_name = os.path.splitext(output_file)[0]
+        comments_file = f"{base_name}.comments.md"
+
     # Mark Confluence TOC macros (before Pandoc processing)
     log("Detecting TOC macros...")
     html_content = mark_confluence_toc(html_content)
@@ -544,6 +685,13 @@ def pull_command(page_id: str, output_file: Optional[str] = None) -> None:
     if output_file:
         Path(output_file).write_text(markdown_content, encoding="utf-8")
         print(f"Wrote: {output_file}", file=sys.stderr)
+        
+        # Write comments file if there are any comments
+        if comments_list and comments_file:
+            page_title = page_data.get("title", "Document")
+            comments_md = format_comments_as_markdown(page_title, comments_list)
+            Path(comments_file).write_text(comments_md, encoding="utf-8")
+            print(f"Wrote: {comments_file} ({len(comments_list)} comment(s))", file=sys.stderr)
     else:
         # No file specified - write to stdout
         sys.stdout.write(markdown_content)
@@ -632,6 +780,9 @@ def markdown_to_confluence_storage(markdown_content: str) -> str:
     # Unescape HTML entities for Confluence macros (do &amp; last to avoid double-unescaping)
     for old, new in [("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&amp;", "&")]:
         html_content = html_content.replace(old, new)
+
+    # Restore inline comment markers
+    html_content = restore_inline_comment_markers(html_content)
 
     log("Converted markdown to HTML")
     return html_content
